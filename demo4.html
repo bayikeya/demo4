@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>高精度補正版＋手動ログ記録</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    body { margin: 0; overflow: hidden; background-color: #000; color: white; font-family: sans-serif; text-align: center; }
+    #camera { width: 100vw; height: 100vh; object-fit: cover; position: absolute; top: 0; left: 0; z-index: -1; }
+    #info { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.6); padding: 10px; border-radius: 8px; z-index: 1; white-space: pre-wrap; }
+    #image { position: absolute; bottom: 180px; left: 50%; transform: translateX(-50%); width: 300px; height: 300px; object-fit: contain; display: none; z-index: 1; background: black; }
+    .btn { position: absolute; left: 50%; transform: translateX(-50%); color: white; border: none; padding: 10px 20px; font-size: 14px; border-radius: 8px; cursor: pointer; z-index: 2; }
+    #patternBtn { bottom: 70px; background-color: #007BFF; display: none; }
+    #nextBtn { bottom: 20px; background-color: #007BFF; display: none; }
+    #logBtn { bottom: 130px; background-color: #28a745; }
+    #recordBtn { bottom: 180px; background-color: #ff9800; }
+    .img-nav { position: absolute; bottom: 260px; z-index: 2; font-size: 20px; background: rgba(0,0,0,0.5); color: white; border: none; padding: 5px 15px; cursor: pointer; border-radius: 6px; }
+    #prevBtn { left: 10%; }
+    #nextImgBtn { right: 10%; }
+  </style>
+</head>
+<body>
+
+<video id="camera" autoplay playsinline muted></video>
+<div id="info">位置情報取得中...</div>
+<img id="image" src="" alt="スポット画像" />
+<button class="btn" id="patternBtn" onclick="switchPattern()">English</button>
+<button class="btn" id="nextBtn" onclick="goToNextSpot()">このスポットは完了</button>
+<button class="btn" id="recordBtn" onclick="recordLog()">📍 この位置を記録</button>
+<button class="btn" id="logBtn" onclick="downloadLog()">📥 ログをダウンロード</button>
+<button class="img-nav" id="prevBtn" onclick="showPrevImage()" style="display:none;">←</button>
+<button class="img-nav" id="nextImgBtn" onclick="showNextImage()" style="display:none;">→</button>
+<audio id="audio" src=""></audio>
+
+<script>
+// ==== スポット設定 ====
+const spots = [
+  { name: "13号館前", lat: 35.69304350697483, lon: 140.05084706907195, radius: 0, images: ["image0.jpeg", "image1.jpeg"], audio: { A: "spot1.ja.mp3", B: "spot1.en.mp3", C: "spot1.ch.mp3" }},
+  { name: "曲がり角左１", lat: 35.693237099346376, lon: 140.0510123108731, radius: 10, images: ["image2.jpeg", "image10.jpeg"], audio: { A: "spot2.ja.mp3", B: "spot2.en.mp3", C: "spot2.ch.mp3" }},
+  { name: "曲がり角右１", lat: 35.6933688901654, lon: 140.05042624826697, radius: 10, images: ["image3.jpeg", "image11.jpeg"], audio: { A: "spot3,4.ja.mp3", B: "spot3,4.en.mp3", C: "spot3,4.ch.mp3" }},
+  { name: "目的地", lat: 35.69285055749237, lon: 140.05080838028817, radius: 10, images: ["image9.jpeg", "image18.jpeg"], audio: { A: "spot9.ja.mp3", B: "spot9.en.mp3", C: "spot9.ch.mp3" }}
+];
+
+// ==== 状態 ====
+let currentIndex = 0;
+let hasEnteredSpot = false;
+let currentSpot = null;
+let currentPattern = "A";
+let imageIndex = 0;
+let logData = [];
+let latestGPS = { raw: null, est: null, acc: null };
+
+// ==== UI ====
+const info = document.getElementById("info");
+const image = document.getElementById("image");
+const audio = document.getElementById("audio");
+const patternBtn = document.getElementById("patternBtn");
+const nextBtn = document.getElementById("nextBtn");
+
+// ==== カメラ ====
+navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } })
+  .then(stream => (document.getElementById("camera").srcObject = stream))
+  .catch(err => alert("カメラアクセス失敗: " + err));
+
+// ==== 距離関数 ====
+function getDistance(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLon/2)**2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+// ==== Kalman ====
+class SimpleKalman2D {
+  constructor(){ this.x=null; }
+  init(lat,lon){ this.x=[lat,lon,0,0]; }
+  predict(){ if(!this.x)return; this.x[0]+=this.x[2]; this.x[1]+=this.x[3]; }
+  update(lat,lon){ if(!this.x)this.init(lat,lon); this.predict(); const K=0.25; this.x[2]=(lat-this.x[0])*K; this.x[3]=(lon-this.x[1])*K; this.x[0]+=this.x[2]; this.x[1]+=this.x[3]; }
+  get(){ return this.x?{lat:this.x[0],lon:this.x[1]}:null; }
+}
+
+// ==== スパイク除去 ====
+let lastRaw=null;
+function isSpike(prev,curr,acc){ if(!prev)return false; const d=getDistance(prev.lat,prev.lon,curr.lat,curr.lon); return d>25&&acc>20; }
+
+// ==== マップスナップ ====
+function snapToSpot(lat,lon,spot){ const d=getDistance(lat,lon,spot.lat,spot.lon); return d<8?{lat:spot.lat,lon:spot.lon}:{lat,lon}; }
+
+// ==== 表示 ====
+function checkProximity(lat,lon,acc){
+  if(currentIndex>=spots.length){ info.innerText="全スポット通過"; return; }
+  const s=spots[currentIndex];
+  const d=getDistance(lat,lon,s.lat,s.lon);
+  info.innerText=`現在地: ${lat.toFixed(6)}, ${lon.toFixed(6)}\n残距離: ${d.toFixed(1)}m\n精度: ±${acc.toFixed(1)}m\n次: ${s.name}`;
+  if(currentIndex>=1&&!hasEnteredSpot&&d<Math.max(s.radius||10,acc)) showSpot(s);
+}
+
+// ==== スポット ====
+function showSpot(s){
+  hasEnteredSpot=true; currentSpot=s; imageIndex=0;
+  audio.src=s.audio[currentPattern]; image.src=s.images[0];
+  image.style.display="block"; nextBtn.style.display="block"; patternBtn.style.display="block";
+  audio.loop=true; audio.play().catch(e=>console.log("音声失敗",e));
+}
+function goToNextSpot(){ audio.pause(); currentIndex++; hasEnteredSpot=false; currentSpot=null; image.style.display="none"; nextBtn.style.display="none"; patternBtn.style.display="none"; }
+
+// ==== パターン切替 ====
+function switchPattern(){
+  const p=["A","B","C"]; currentPattern=p[(p.indexOf(currentPattern)+1)%p.length];
+  patternBtn.innerText=currentPattern==="A"?"English":currentPattern==="B"?"中文":"日本語";
+  if(currentSpot){ audio.pause(); audio.src=currentSpot.audio[currentPattern]; audio.play(); }
+}
+
+// ==== GPS監視 ====
+const kf=new SimpleKalman2D();
+navigator.geolocation.watchPosition(pos=>{
+  const {latitude:lat,longitude:lon,accuracy:acc}=pos.coords;
+  const raw={lat,lon};
+  if(isSpike(lastRaw,raw,acc))return;
+  lastRaw=raw;
+  kf.update(lat,lon);
+  const est=kf.get();
+  const currSpot=spots[currentIndex];
+  const snapped=snapToSpot(est.lat,est.lon,currSpot);
+  latestGPS={raw,est:snapped,acc};
+  checkProximity(snapped.lat,snapped.lon,acc);
+},{enableHighAccuracy:true,maximumAge:0,timeout:10000});
+
+// ==== 任意ログ記録 ====
+function recordLog(){
+  if(!latestGPS.raw){ alert("まだ位置を取得できていません"); return; }
+  const d=latestGPS;
+  const now=new Date().toISOString();
+  logData.push({
+    time: now,
+    raw_lat: d.raw.lat,
+    raw_lon: d.raw.lon,
+    est_lat: d.est.lat,
+    est_lon: d.est.lon,
+    acc: d.acc.toFixed(1),
+    spot: spots[currentIndex]?.name || "未設定"
+  });
+  alert(`記録しました (${logData.length}件目)\n地点: ${spots[currentIndex]?.name || "N/A"}`);
+}
+
+// ==== CSV出力 ====
+function downloadLog(){
+  if(logData.length===0){ alert("ログがありません"); return; }
+  const header="time,spot,raw_lat,raw_lon,est_lat,est_lon,accuracy\n";
+  const rows=logData.map(d=>`${d.time},${d.spot},${d.raw_lat},${d.raw_lon},${d.est_lat},${d.est_lon},${d.acc}`).join("\n");
+  const blob=new Blob([header+rows],{type:"text/csv"});
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(blob);
+  a.download="manual_log.csv";
+  a.click();
+}
+
+window.onload=()=>{ showSpot(spots[0]); patternBtn.innerText="English"; };
+</script>
+</body>
+</html>
